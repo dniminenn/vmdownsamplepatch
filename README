@@ -1,0 +1,23 @@
+Tiered downsampling for single-node VictoriaMetrics OSS. ~210 line
+build-time patch, not a fork. No cluster support.
+
+  -downsampling.period=30d:5m,180d:1h
+
+Last sample per 5m for data older than 30d, per 1h older than 180d.
+Same semantics as -dedup.minScrapeInterval, no aggregation. Older tiers
+need bigger intervals, divisible by newer ones. Queries thin
+immediately, disk reclaimed by the hourly historical merge watcher.
+
+Build:
+
+  ./build.sh v1.148.0
+  -> dist/victoria-metrics-linux-amd64-v1.148.0-downsampling.tar.gz
+
+Or: git apply vm-downsampling.patch (older tags: patch -p1 --fuzz=3).
+Prebuilt linux-amd64 binaries under releases.
+
+Set retention to cover the data, e.g.
+-retentionPeriod=2y -downsampling.period=30d:5m,180d:1h
+
+Apache 2.0, same as upstream. Independent reimplementation, no
+enterprise code. Unofficial, not affiliated with VictoriaMetrics, Inc.

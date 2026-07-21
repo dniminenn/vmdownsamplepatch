@@ -1,0 +1,213 @@
+diff --git a/app/vmselect/netstorage/netstorage.go b/app/vmselect/netstorage/netstorage.go
+index e0539c12d..564470846 100644
+--- a/app/vmselect/netstorage/netstorage.go
++++ b/app/vmselect/netstorage/netstorage.go
+@@ -604,7 +604,7 @@ func mergeSortBlocks(dst *Result, sbh *sortBlocksHeap, dedupInterval int64) {
+ 			putSortBlock(top)
+ 		}
+ 	}
+-	timestamps, values := storage.DeduplicateSamples(dst.Timestamps, dst.Values, dedupInterval)
++	timestamps, values := storage.DeduplicateSamplesWithDownsampling(dst.Timestamps, dst.Values, dedupInterval)
+ 	dedupSamples += len(dst.Timestamps) - len(timestamps)
+ 	dedupsDuringSelect.Add(dedupSamples)
+ 	dst.Timestamps = timestamps
+diff --git a/app/vmstorage/main.go b/app/vmstorage/main.go
+index 52815aa9c..8ef98300a 100644
+--- a/app/vmstorage/main.go
++++ b/app/vmstorage/main.go
+@@ -52,6 +52,9 @@ var (
+ 		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
+ 	minScrapeInterval = flag.Duration("dedup.minScrapeInterval", 0, "Leave only the last sample in every time series per each discrete interval "+
+ 		"equal to -dedup.minScrapeInterval > 0. See also -streamAggr.dedupInterval and https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#deduplication")
++	downsamplingPeriods = flag.String("downsampling.period", "", "Comma-separated downsampling periods in the format 'offset:interval'. For example, '30d:5m,180d:1h' "+
++		"leaves the last sample per each 5m interval for samples older than 30 days and the last sample per each 1h interval for samples older than 180 days. "+
++		"Intervals for older periods must be bigger than and divisible by intervals for newer periods. See also -dedup.minScrapeInterval")
+ 	inmemoryDataFlushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second, "The interval for guaranteed saving of in-memory data to disk. "+
+ 		"The saved data survives unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. "+
+ 		"Bigger intervals may help increase the lifetime of flash storage with limited write cycles (e.g. Raspberry PI). "+
+@@ -118,6 +121,9 @@ func DataPath() string {
+ // Init initializes vmstorage.
+ func Init(vmselectMaxConcurrentRequests int, vmselectMaxQueueDuration time.Duration, resetCacheIfNeeded func(mrs []storage.MetricRow)) {
+ 	storage.SetDedupInterval(*minScrapeInterval)
++	if err := storage.SetDownsamplingPeriods(*downsamplingPeriods); err != nil {
++		logger.Fatalf("cannot parse -downsampling.period=%q: %s", *downsamplingPeriods, err)
++	}
+ 	storage.SetDataFlushInterval(*inmemoryDataFlushInterval)
+ 	storage.LegacySetRetentionTimezoneOffset(*retentionTimezoneOffset)
+ 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
+diff --git a/lib/storage/block.go b/lib/storage/block.go
+index 53c8653aa..19f320c03 100644
+--- a/lib/storage/block.go
++++ b/lib/storage/block.go
+@@ -3,6 +3,7 @@ package storage
+ import (
+ 	"fmt"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/atomicutil"
+ 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+@@ -163,7 +164,7 @@ func (b *Block) deduplicateSamplesDuringMerge() {
+ 		// Nothing to dedup.
+ 		return
+ 	}
+-	dedupInterval := GetDedupInterval()
++	dedupInterval := dedupIntervalForTimestamp(srcTimestamps[len(srcTimestamps)-1], time.Now().UnixMilli())
+ 	if dedupInterval <= 0 {
+ 		// Deduplication is disabled.
+ 		return
+diff --git a/lib/storage/dedup.go b/lib/storage/dedup.go
+index cc43ba1f6..75e221679 100644
+--- a/lib/storage/dedup.go
++++ b/lib/storage/dedup.go
+@@ -23,7 +23,7 @@ func GetDedupInterval() int64 {
+ var globalDedupInterval int64
+ 
+ func isDedupEnabled() bool {
+-	return globalDedupInterval > 0
++	return globalDedupInterval > 0 || isDownsamplingEnabled()
+ }
+ 
+ // DeduplicateSamples removes samples from src* if they are closer to each other than dedupInterval in milliseconds.
+diff --git a/lib/storage/downsampling.go b/lib/storage/downsampling.go
+new file mode 100644
+index 000000000..88fa22bb4
+--- /dev/null
++++ b/lib/storage/downsampling.go
+@@ -0,0 +1,114 @@
++package storage
++
++import (
++	"fmt"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
++)
++
++type downsamplingPeriod struct {
++	offsetMsecs   int64
++	intervalMsecs int64
++}
++
++// sorted by offsetMsecs desc; set before storage init, read-only afterwards
++var downsamplingPeriods []downsamplingPeriod
++
++// SetDownsamplingPeriods sets downsampling tiers from a comma-separated list of `offset:interval` pairs, e.g. "30d:5m,180d:1h".
++// Samples older than `offset` are deduplicated with `interval` the same way as -dedup.minScrapeInterval does.
++func SetDownsamplingPeriods(s string) error {
++	downsamplingPeriods = nil
++	if s = strings.TrimSpace(s); s == "" {
++		return nil
++	}
++	var dsps []downsamplingPeriod
++	for _, x := range strings.Split(s, ",") {
++		x = strings.TrimSpace(x)
++		parts := strings.Split(x, ":")
++		if len(parts) != 2 {
++			return fmt.Errorf("cannot parse downsampling period %q; must have `offset:interval` format", x)
++		}
++		offset, err := timeutil.ParseDuration(parts[0])
++		if err != nil {
++			return fmt.Errorf("cannot parse offset in downsampling period %q: %w", x, err)
++		}
++		interval, err := timeutil.ParseDuration(parts[1])
++		if err != nil {
++			return fmt.Errorf("cannot parse interval in downsampling period %q: %w", x, err)
++		}
++		if offset <= 0 || interval < time.Second {
++			return fmt.Errorf("downsampling period %q: offset must be positive and interval cannot be smaller than 1s", x)
++		}
++		dsps = append(dsps, downsamplingPeriod{offsetMsecs: offset.Milliseconds(), intervalMsecs: interval.Milliseconds()})
++	}
++	sort.Slice(dsps, func(i, j int) bool { return dsps[i].offsetMsecs > dsps[j].offsetMsecs })
++	for i := 1; i < len(dsps); i++ {
++		prev, curr := dsps[i-1], dsps[i]
++		if curr.offsetMsecs == prev.offsetMsecs {
++			return fmt.Errorf("duplicate downsampling offset %s", time.Duration(curr.offsetMsecs)*time.Millisecond)
++		}
++		if prev.intervalMsecs <= curr.intervalMsecs || prev.intervalMsecs%curr.intervalMsecs != 0 {
++			return fmt.Errorf("interval for offset %s must be bigger than and divisible by the interval for offset %s", time.Duration(prev.offsetMsecs)*time.Millisecond, time.Duration(curr.offsetMsecs)*time.Millisecond)
++		}
++	}
++	downsamplingPeriods = dsps
++	return nil
++}
++
++func isDownsamplingEnabled() bool {
++	return len(downsamplingPeriods) > 0
++}
++
++// dedupIntervalForTimestamp returns the dedup interval for a sample with the given timestamp:
++// the interval of the matching downsampling tier, but not smaller than the global dedup interval.
++func dedupIntervalForTimestamp(ts, nowMsecs int64) int64 {
++	d := globalDedupInterval
++	for _, dsp := range downsamplingPeriods {
++		if nowMsecs-ts >= dsp.offsetMsecs {
++			if dsp.intervalMsecs > d {
++				d = dsp.intervalMsecs
++			}
++			break
++		}
++	}
++	return d
++}
++
++// DeduplicateSamplesWithDownsampling is the same as DeduplicateSamples, but it splits the samples
++// at downsampling tier boundaries and deduplicates every segment with the interval of its tier.
++func DeduplicateSamplesWithDownsampling(srcTimestamps []int64, srcValues []float64, dedupInterval int64) ([]int64, []float64) {
++	if len(downsamplingPeriods) == 0 {
++		return DeduplicateSamples(srcTimestamps, srcValues, dedupInterval)
++	}
++	if len(srcTimestamps) == 0 {
++		return srcTimestamps, srcValues
++	}
++	nowMsecs := time.Now().UnixMilli()
++	dstTimestamps, dstValues := srcTimestamps[:0], srcValues[:0]
++	start := 0
++	// segments go from oldest to newest; DeduplicateSamples works in place and every segment's
++	// output lands at or before its input, so the appends never overwrite unread source samples
++	for _, dsp := range downsamplingPeriods {
++		if start >= len(srcTimestamps) {
++			break
++		}
++		boundary := nowMsecs - dsp.offsetMsecs
++		end := start + sort.Search(len(srcTimestamps)-start, func(i int) bool { return srcTimestamps[start+i] > boundary })
++		if end > start {
++			interval := max(dsp.intervalMsecs, dedupInterval)
++			timestamps, values := DeduplicateSamples(srcTimestamps[start:end], srcValues[start:end], interval)
++			dstTimestamps = append(dstTimestamps, timestamps...)
++			dstValues = append(dstValues, values...)
++		}
++		start = end
++	}
++	if start < len(srcTimestamps) {
++		timestamps, values := DeduplicateSamples(srcTimestamps[start:], srcValues[start:], dedupInterval)
++		dstTimestamps = append(dstTimestamps, timestamps...)
++		dstValues = append(dstValues, values...)
++	}
++	return dstTimestamps, dstValues
++}
+diff --git a/lib/storage/partition.go b/lib/storage/partition.go
+index de151122c..9cdb76f19 100644
+--- a/lib/storage/partition.go
++++ b/lib/storage/partition.go
+@@ -1196,7 +1196,7 @@ func (pt *partition) releasePartsToMerge(pws []*partWrapper) {
+ }
+ 
+ func (pt *partition) isFinalDedupNeeded() bool {
+-	dedupInterval := GetDedupInterval()
++	dedupInterval := dedupIntervalForTimestamp(pt.tr.MaxTimestamp, time.Now().UnixMilli())
+ 
+ 	pws := pt.GetParts(nil, false)
+ 	minDedupInterval := getMinDedupInterval(pws)
+@@ -1432,7 +1432,7 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
+ 		return nil, fmt.Errorf("cannot merge %d parts to %s: %w", len(bsrs), dstPartPath, err)
+ 	}
+ 	if dstPartPath != "" {
+-		ph.MinDedupInterval = GetDedupInterval()
++		ph.MinDedupInterval = dedupIntervalForTimestamp(ph.MaxTimestamp, currentTimestamp)
+ 		ph.MustWriteMetadata(dstPartPath)
+ 	}
+ 	return &ph, nil
