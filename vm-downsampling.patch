@@ -1,8 +1,8 @@
 diff --git a/app/vmselect/netstorage/netstorage.go b/app/vmselect/netstorage/netstorage.go
-index e0539c12d..564470846 100644
+index 5c15686..76198ac 100644
 --- a/app/vmselect/netstorage/netstorage.go
 +++ b/app/vmselect/netstorage/netstorage.go
-@@ -604,7 +604,7 @@ func mergeSortBlocks(dst *Result, sbh *sortBlocksHeap, dedupInterval int64) {
+@@ -637,7 +637,7 @@ func mergeSortBlocks(dst *Result, sbh *sortBlocksHeap, dedupInterval int64) {
  			putSortBlock(top)
  		}
  	}
@@ -12,10 +12,10 @@ index e0539c12d..564470846 100644
  	dedupsDuringSelect.Add(dedupSamples)
  	dst.Timestamps = timestamps
 diff --git a/app/vmstorage/main.go b/app/vmstorage/main.go
-index 52815aa9c..8ef98300a 100644
+index f70cf62..9b3cba5 100644
 --- a/app/vmstorage/main.go
 +++ b/app/vmstorage/main.go
-@@ -52,6 +52,9 @@ var (
+@@ -56,6 +56,9 @@ var (
  		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
  	minScrapeInterval = flag.Duration("dedup.minScrapeInterval", 0, "Leave only the last sample in every time series per each discrete interval "+
  		"equal to -dedup.minScrapeInterval > 0. See also -streamAggr.dedupInterval and https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#deduplication")
@@ -25,7 +25,7 @@ index 52815aa9c..8ef98300a 100644
  	inmemoryDataFlushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second, "The interval for guaranteed saving of in-memory data to disk. "+
  		"The saved data survives unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. "+
  		"Bigger intervals may help increase the lifetime of flash storage with limited write cycles (e.g. Raspberry PI). "+
-@@ -118,6 +121,9 @@ func DataPath() string {
+@@ -122,6 +125,9 @@ func DataPath() string {
  // Init initializes vmstorage.
  func Init(vmselectMaxConcurrentRequests int, vmselectMaxQueueDuration time.Duration, resetCacheIfNeeded func(mrs []storage.MetricRow)) {
  	storage.SetDedupInterval(*minScrapeInterval)
@@ -36,7 +36,7 @@ index 52815aa9c..8ef98300a 100644
  	storage.LegacySetRetentionTimezoneOffset(*retentionTimezoneOffset)
  	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
 diff --git a/lib/storage/block.go b/lib/storage/block.go
-index 53c8653aa..19f320c03 100644
+index 53c8653..19f320c 100644
 --- a/lib/storage/block.go
 +++ b/lib/storage/block.go
 @@ -3,6 +3,7 @@ package storage
@@ -57,7 +57,7 @@ index 53c8653aa..19f320c03 100644
  		// Deduplication is disabled.
  		return
 diff --git a/lib/storage/dedup.go b/lib/storage/dedup.go
-index cc43ba1f6..75e221679 100644
+index cc43ba1..75e2216 100644
 --- a/lib/storage/dedup.go
 +++ b/lib/storage/dedup.go
 @@ -23,7 +23,7 @@ func GetDedupInterval() int64 {
@@ -71,7 +71,7 @@ index cc43ba1f6..75e221679 100644
  // DeduplicateSamples removes samples from src* if they are closer to each other than dedupInterval in milliseconds.
 diff --git a/lib/storage/downsampling.go b/lib/storage/downsampling.go
 new file mode 100644
-index 000000000..88fa22bb4
+index 0000000..88fa22b
 --- /dev/null
 +++ b/lib/storage/downsampling.go
 @@ -0,0 +1,114 @@
@@ -190,7 +190,7 @@ index 000000000..88fa22bb4
 +	return dstTimestamps, dstValues
 +}
 diff --git a/lib/storage/partition.go b/lib/storage/partition.go
-index de151122c..9cdb76f19 100644
+index d1db56e..ba84057 100644
 --- a/lib/storage/partition.go
 +++ b/lib/storage/partition.go
 @@ -1196,7 +1196,7 @@ func (pt *partition) releasePartsToMerge(pws []*partWrapper) {
@@ -202,7 +202,7 @@ index de151122c..9cdb76f19 100644
  
  	pws := pt.GetParts(nil, false)
  	minDedupInterval := getMinDedupInterval(pws)
-@@ -1432,7 +1432,7 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
+@@ -1435,7 +1435,7 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
  		return nil, fmt.Errorf("cannot merge %d parts to %s: %w", len(bsrs), dstPartPath, err)
  	}
  	if dstPartPath != "" {

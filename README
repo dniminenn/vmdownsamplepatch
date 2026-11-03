@@ -8,15 +8,40 @@ Same semantics as -dedup.minScrapeInterval, no aggregation. Older tiers
 need bigger intervals, divisible by newer ones. Queries thin
 immediately, disk reclaimed by the hourly historical merge watcher.
 
-Apply to a VictoriaMetrics checkout, e.g. v1.151.0:
+Build and test a release (Go and Python 3 required):
 
-  git apply vm-downsampling.patch        (older tags: patch -p1 --fuzz=3)
-  cp downsampling_test.go lib/storage/
-  go test ./lib/storage/ -run 'Downsampling|DedupInterval'
+  ./build.sh v1.155.0
+
+The script clones a fresh upstream checkout, requires a strict patch application,
+runs the complete storage and query-merge test suites, builds a static linux-amd64
+binary, and tests query thinning and disk merges using an isolated database.
+Artifacts and SHA256 checksums are written to dist/. Source is retained under
+work/. An optional second argument reuses a clean checkout at the requested tag;
+the script never resets an existing checkout.
+
+Or apply manually from inside a pristine upstream checkout:
+
+  git apply /path/to/vmdownsamplepatch/vm-downsampling.patch
+  cp /path/to/vmdownsamplepatch/downsampling_test.go lib/storage/
+  go test ./lib/storage ./app/vmselect/netstorage -count=1
   make victoria-metrics-prod
+
+Validated 2026-11-03 against v1.155.0 (3fec2f72414d00d1acda807c8818d7af90cc966d).
+The patch needed only refreshed upstream context; its tier logic is unchanged.
+The runtime smoke test feeds 60 one-minute samples to each of three age tiers:
+2 hourly samples, 13 five-minute samples, and all 60 recent samples survive.
+It then restarts with tiers disabled and checks the same data, proving that
+the merge reclaimed samples on disk rather than merely hiding them at query time.
+
+  python3 smoke-test.py /path/to/victoria-metrics-prod
 
 Set retention to cover the data, e.g.
 -retentionPeriod=2y -downsampling.period=30d:5m,180d:1h
+
+Downsampling is destructive. Back up before changing tiers or upgrading.
+Monthly partitions are scheduled using their newest timestamp, so an entire
+month must age beyond a tier boundary before its final thinning merge runs.
+Zero scheduled partitions alone does not mean downsampling is broken.
 
 Apache 2.0, same as upstream. Independent reimplementation, no
 enterprise code. Unofficial, not affiliated with VictoriaMetrics, Inc.
